@@ -3,6 +3,10 @@ import { Button } from "@/components/ui/button";
 import { UploadIcon } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { Progress } from "@/components/ui/progress";
+import * as XLSX from "xlsx";
+import { apiRequest } from "@/lib/queryClient";
+import { InsertCompany } from "@shared/schema";
+import { formatFileSize, normalizeHeaders } from "@/lib/utils";
 
 interface ImportExcelProps {
   onImportSuccess: (message: string, count: number) => void;
@@ -35,14 +39,14 @@ export function ImportExcel({ onImportSuccess }: ImportExcelProps) {
     if (file.size > 5 * 1024 * 1024) {
       toast({
         title: "File too large",
-        description: "Please upload a file smaller than 5MB",
+        description: `Please upload a file smaller than 5MB. Current size: ${formatFileSize(file.size)}`,
         variant: "destructive"
       });
       return;
     }
 
-    // Upload file
-    await uploadFile(file);
+    // Process file
+    await processExcelFile(file);
     
     // Reset file input
     if (fileInputRef.current) {
@@ -50,46 +54,145 @@ export function ImportExcel({ onImportSuccess }: ImportExcelProps) {
     }
   };
 
-  const uploadFile = async (file: File) => {
+  const processExcelFile = async (file: File) => {
     setIsUploading(true);
     setUploadProgress(0);
     
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-
-      // Simulate progress updates
-      const progressInterval = setInterval(() => {
-        setUploadProgress(prev => Math.min(prev + 10, 90));
-      }, 200);
-
-      const response = await fetch("/api/import", {
-        method: "POST",
-        body: formData,
-      });
-
-      clearInterval(progressInterval);
-      setUploadProgress(100);
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || "Failed to import file");
+      // Show reading progress
+      setUploadProgress(20);
+      
+      // Read the file as array buffer
+      const arrayBuffer = await file.arrayBuffer();
+      
+      // Parse workbook
+      setUploadProgress(40);
+      const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+      
+      // Get first worksheet
+      const worksheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[worksheetName];
+      
+      // Convert to JSON
+      setUploadProgress(60);
+      const data = XLSX.utils.sheet_to_json<Record<string, any>>(worksheet, { header: 1 });
+      
+      if (data.length < 2) {
+        throw new Error("File contains no data or missing headers");
       }
-
-      const result = await response.json();
+      
+      // First row is headers
+      const headers = data[0] as string[];
+      // Normalize headers (convert to camelCase, remove spaces, etc.)
+      const normalizedHeaders = normalizeHeaders(headers);
+      
+      // Remaining rows are data
+      const rows = data.slice(1);
+      
+      // Process rows to match company schema
+      setUploadProgress(80);
+      const companies: Partial<InsertCompany>[] = [];
+      
+      for (const row of rows) {
+        if (!Array.isArray(row) || row.length === 0) continue;
+        
+        const company: Partial<InsertCompany> = {};
+        
+        // Map cells to company properties based on headers
+        normalizedHeaders.forEach((header, index) => {
+          const value = row[index];
+          if (value === undefined) return;
+          
+          switch (header.toLowerCase()) {
+            case 'name':
+              company.name = String(value);
+              break;
+            case 'contact':
+            case 'contactname':
+            case 'contactperson':
+              company.contact = String(value);
+              break;
+            case 'email':
+            case 'emailaddress':
+              company.email = String(value);
+              break;
+            case 'phone':
+            case 'phonenumber':
+              company.phone = String(value);
+              break;
+            case 'industry':
+            case 'sector':
+              company.industry = String(value);
+              break;
+            case 'location':
+            case 'address':
+              company.location = String(value);
+              break;
+            case 'employees':
+            case 'employeecount':
+            case 'employeenumber':
+              company.employees = typeof value === 'number' ? value : parseInt(String(value)) || 0;
+              break;
+            case 'revenue':
+            case 'annualrevenue':
+              company.revenue = String(value);
+              break;
+            case 'status':
+            case 'companystatus':
+              company.status = String(value);
+              break;
+            case 'lastcontact':
+            case 'lastcontactdate':
+              company.lastContact = String(value);
+              break;
+            default:
+              // Ignore unknown headers
+              break;
+          }
+        });
+        
+        // Validate required fields
+        if (company.name && company.contact && company.email) {
+          // Fill in defaults for missing fields
+          if (!company.phone) company.phone = "N/A";
+          if (!company.industry) company.industry = "Other";
+          if (!company.location) company.location = "Unknown";
+          if (!company.employees) company.employees = 0;
+          if (!company.revenue) company.revenue = "Unknown";
+          if (!company.status) company.status = "New";
+          if (!company.lastContact) company.lastContact = new Date().toISOString().split('T')[0];
+          
+          companies.push(company as InsertCompany);
+        }
+      }
+      
+      if (companies.length === 0) {
+        throw new Error("No valid company data found in file");
+      }
+      
+      // Submit data to API
+      setUploadProgress(90);
+      const result = await apiRequest(
+        "POST", 
+        "/api/import", 
+        companies
+      );
+      
+      const responseData = await result.json();
+      setUploadProgress(100);
       
       // Call onImportSuccess callback
-      onImportSuccess(result.message, result.recordsAdded);
+      onImportSuccess("Import successful", companies.length);
       
       toast({
         title: "Import Successful",
-        description: `Imported ${result.recordsAdded} records from ${file.name}`,
+        description: `Imported ${companies.length} companies from ${file.name}`,
       });
     } catch (error) {
-      console.error("Error importing file:", error);
+      console.error("Error processing Excel file:", error);
       toast({
         title: "Import Failed",
-        description: error instanceof Error ? error.message : "Failed to import file",
+        description: error instanceof Error ? error.message : "Failed to process file",
         variant: "destructive"
       });
     } finally {
@@ -121,7 +224,7 @@ export function ImportExcel({ onImportSuccess }: ImportExcelProps) {
         focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500`}
       >
         <UploadIcon className="h-5 w-5 mr-2" />
-        {isUploading ? "Uploading..." : "Import Excel"}
+        {isUploading ? "Processing..." : "Import Excel"}
       </label>
       
       {isUploading && (
