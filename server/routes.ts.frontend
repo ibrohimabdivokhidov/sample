@@ -1,0 +1,18 @@
+import express, { type Express, Request, Response } from "express";
+import { createServer, type Server } from "http";
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  const apiRouter = express.Router();
+  
+  // Simple 404 response for all API routes
+  apiRouter.all("*", (req: Request, res: Response) => {
+    res.status(404).json({ 
+      message: "This endpoint is not available. The application is running in frontend-only mode." 
+    });
+  });
+
+  app.use("/api", apiRouter);
+  
+  const httpServer = createServer(app);
+  return httpServer;
+}
