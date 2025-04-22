@@ -1,4 +1,6 @@
 import { companies, users, type User, type InsertUser, type Company, type InsertCompany } from "@shared/schema";
+import { db } from "./db";
+import { eq, or, ilike, count, desc, sql } from "drizzle-orm";
 
 export interface IStorage {
   getUser(id: number): Promise<User | undefined>;
@@ -15,144 +17,113 @@ export interface IStorage {
   createManyCompanies(companies: InsertCompany[]): Promise<number>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<number, User>;
-  private companiesMap: Map<number, Company>;
-  currentUserId: number;
-  currentCompanyId: number;
-
-  constructor() {
-    this.users = new Map();
-    this.companiesMap = new Map();
-    this.currentUserId = 1;
-    this.currentCompanyId = 1;
-    
-    // Add some initial sample companies
-    const sampleCompanies: InsertCompany[] = [
-      {
-        name: "Acme Inc.",
-        contact: "John Smith",
-        email: "john@acmeinc.com",
-        phone: "+1 (555) 123-4567",
-        industry: "Technology",
-        location: "San Francisco, CA",
-        employees: 250,
-        revenue: "$25M",
-        status: "Active",
-        lastContact: "2023-08-15",
-      },
-      {
-        name: "TechCorp",
-        contact: "Jane Doe",
-        email: "jane@techcorp.com",
-        phone: "+1 (555) 987-6543",
-        industry: "Software",
-        location: "Austin, TX",
-        employees: 500,
-        revenue: "$50M",
-        status: "Pending",
-        lastContact: "2023-08-10",
-      },
-      {
-        name: "Global Industries",
-        contact: "Michael Johnson",
-        email: "michael@globalind.com",
-        phone: "+1 (555) 222-3333",
-        industry: "Manufacturing",
-        location: "Chicago, IL",
-        employees: 1200,
-        revenue: "$120M",
-        status: "Inactive",
-        lastContact: "2023-07-22",
-      }
-    ];
-    
-    sampleCompanies.forEach(company => this.createCompany(company));
-  }
-
+export class DatabaseStorage implements IStorage {
   async getUser(id: number): Promise<User | undefined> {
-    return this.users.get(id);
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
   }
 
   async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
-    );
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user;
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    const id = this.currentUserId++;
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
+    const [user] = await db
+      .insert(users)
+      .values(insertUser)
+      .returning();
     return user;
   }
 
   async getCompanies(page: number, pageSize: number): Promise<{ companies: Company[], total: number }> {
-    const companies = Array.from(this.companiesMap.values());
-    const total = companies.length;
-    const startIndex = (page - 1) * pageSize;
-    const endIndex = startIndex + pageSize;
+    // Get total count
+    const [result] = await db.select({ value: count() }).from(companies);
+    const total = result?.value || 0;
     
-    return {
-      companies: companies.slice(startIndex, endIndex),
-      total
-    };
+    // Get paginated companies
+    const offset = (page - 1) * pageSize;
+    const companyList = await db
+      .select()
+      .from(companies)
+      .limit(pageSize)
+      .offset(offset)
+      .orderBy(desc(companies.id));
+    
+    return { companies: companyList, total };
   }
 
   async getCompany(id: number): Promise<Company | undefined> {
-    return this.companiesMap.get(id);
+    const [company] = await db.select().from(companies).where(eq(companies.id, id));
+    return company;
   }
 
   async createCompany(insertCompany: InsertCompany): Promise<Company> {
-    const id = this.currentCompanyId++;
-    const company: Company = { ...insertCompany, id };
-    this.companiesMap.set(id, company);
+    const [company] = await db
+      .insert(companies)
+      .values(insertCompany)
+      .returning();
     return company;
   }
 
   async updateCompany(id: number, companyData: Partial<InsertCompany>): Promise<Company | undefined> {
-    const company = this.companiesMap.get(id);
-    if (!company) return undefined;
+    const [updatedCompany] = await db
+      .update(companies)
+      .set(companyData)
+      .where(eq(companies.id, id))
+      .returning();
     
-    const updatedCompany = { ...company, ...companyData };
-    this.companiesMap.set(id, updatedCompany);
     return updatedCompany;
   }
 
   async deleteCompany(id: number): Promise<boolean> {
-    return this.companiesMap.delete(id);
+    const result = await db
+      .delete(companies)
+      .where(eq(companies.id, id));
+    
+    return true; // PostgreSQL doesn't return deleted count in a standard way
   }
 
   async searchCompanies(query: string, page: number, pageSize: number): Promise<{ companies: Company[], total: number }> {
-    const companies = Array.from(this.companiesMap.values());
-    const lowercaseQuery = query.toLowerCase();
-    
-    const filteredCompanies = companies.filter(company => 
-      company.name.toLowerCase().includes(lowercaseQuery) ||
-      company.contact.toLowerCase().includes(lowercaseQuery) ||
-      company.email.toLowerCase().includes(lowercaseQuery) ||
-      company.industry.toLowerCase().includes(lowercaseQuery) ||
-      company.location.toLowerCase().includes(lowercaseQuery)
+    // Build search condition
+    const searchCondition = or(
+      ilike(companies.name, `%${query}%`),
+      ilike(companies.contact, `%${query}%`),
+      ilike(companies.email, `%${query}%`),
+      ilike(companies.industry, `%${query}%`),
+      ilike(companies.location, `%${query}%`)
     );
     
-    const total = filteredCompanies.length;
-    const startIndex = (page - 1) * pageSize;
-    const endIndex = startIndex + pageSize;
+    // Get total count
+    const [result] = await db
+      .select({ value: count() })
+      .from(companies)
+      .where(searchCondition);
+    const total = result?.value || 0;
     
-    return {
-      companies: filteredCompanies.slice(startIndex, endIndex),
-      total
-    };
+    // Get paginated search results
+    const offset = (page - 1) * pageSize;
+    const companyList = await db
+      .select()
+      .from(companies)
+      .where(searchCondition)
+      .limit(pageSize)
+      .offset(offset)
+      .orderBy(desc(companies.id));
+    
+    return { companies: companyList, total };
   }
 
   async createManyCompanies(insertCompanies: InsertCompany[]): Promise<number> {
-    let count = 0;
-    for (const company of insertCompanies) {
-      await this.createCompany(company);
-      count++;
-    }
-    return count;
+    if (insertCompanies.length === 0) return 0;
+    
+    const result = await db
+      .insert(companies)
+      .values(insertCompanies)
+      .returning();
+    
+    return result.length;
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();
